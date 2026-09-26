@@ -140,7 +140,30 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack \
   -H 'Content-Type: application/json' -d "{\"lease_token\":\"$TOKEN\"}"
 ```
 
-### 7. 安全归档压缩
+### 7. 消费游标:回退重投
+
+处理逻辑出错或需要重放历史时,可把**已登记** consumer 的游标回退到 `target_seq`,下一次 `pull` 从 `target_seq + 1` 重新投递:
+
+```bash
+curl -X POST http://localhost:8000/consumers/worker-1/rewind \
+  -H 'Content-Type: application/json' \
+  -d '{"target_seq":42}'
+```
+
+```json
+{"consumer_id": "worker-1", "previous_cursor_seq": 100, "cursor_seq": 42, "next_seq": 43}
+```
+
+- **回退区间**:`target_seq` 必须落在 `[anchor_seq, cursor_seq]`(链锚点 ~ 当前游标)。低于锚点(对应事件已压缩归档、无法重投)或大于当前游标(**向前推进只能经由 `ack` 整批确认**)一律返回 **409** 且状态不变;`target_seq` 等于当前游标时为幂等空操作。
+- **租约**:存在**未过期租约**时返回 **409**(回退会与在途批次冲突);**已过期租约**在同一事务内清除后再回退,旧 token 随之作废,后续 `pull` 不会重投旧批次区间。
+- **未知 consumer** 返回 **409**,不会像 `pull` 那样自动建档。
+- **并发安全**:回退与 `pull`/`ack`/`compact` 在同一写锁下串行执行,并发下只有单一结果;回退后游标不低于链锚点,`compact` 的安全边界也随之收紧,绝不会产生指向已压缩事件的租约。
+
+```json
+{"detail": "target_seq below chain anchor", "target_seq": 3, "anchor_seq": 4}
+```
+
+### 8. 安全归档压缩
 
 已确认消费的历史事件可压缩归档:物理删除 `(当前锚点, cutoff_seq]` 的连续事件前缀,并把最后一条被删记录的 `seq`/`hash` 持久化为**链锚点**,`/integrity` 之后从锚点继续校验,历史不可篡改性不受影响。
 
@@ -216,6 +239,7 @@ curl -s http://localhost:8000/integrity
 - **完整性哈希链**:每条记录引用上一条哈希,写入与链字段更新在同一事务完成(`BEGIN IMMEDIATE` 保证并发下链头一致);`GET /integrity` 全链校验。
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
 - **消费游标与租约**:每个 consumer 一行(`consumers` 表),保存已确认游标与当前租约(token、批次起止 seq、过期时间)。`pull` 在 `BEGIN IMMEDIATE` 事务内完成"判租约 → 取批次 → 写租约",与事件写入互斥,并发重复拉取只会得到同一个租约;`ack` 仅推进整批游标并清空租约,token 不符、过期或无租约一律 409。
+- **游标回退**:`POST /consumers/{consumer_id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验 consumer/租约/回退区间 `[anchor_seq, cursor_seq]` → 清除已过期租约 → 回退游标",与 `pull`/`ack`/`compact` 串行,并发下只有单一结果。未过期租约、低于链锚点、向前推进、未知 consumer 均 409 且状态不变;回退后游标不低于链锚点,不会产生指向已压缩事件的租约。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
@@ -229,6 +253,7 @@ curl -s http://localhost:8000/integrity
 | GET | `/integrity` | 从链锚点校验完整性哈希链,返回 `verified`/`checked`/`first_break`/`anchor_seq` |
 | POST | `/consumers/{consumer_id}/pull` | 按首次接收顺序拉取并原子租用未确认事件(`limit`/`lease_seconds`) |
 | POST | `/consumers/{consumer_id}/ack` | 确认当前租约批次并推进游标;过期/伪造/旧 token 返回 409 |
+| POST | `/consumers/{consumer_id}/rewind` | 游标回退到 `target_seq`(限 `[anchor_seq, cursor_seq]`),下次 `pull` 从 `target_seq+1` 重投;未过期租约/越界/未知 consumer 返回 409 |
 | POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`);越界 409 并返回 `safe_through_seq` |
 | GET | `/health` | 健康检查 |
 

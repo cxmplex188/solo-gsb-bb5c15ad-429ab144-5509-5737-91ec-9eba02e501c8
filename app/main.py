@@ -40,6 +40,11 @@ class AckIn(BaseModel):
     lease_token: str = Field(..., min_length=1, max_length=255)
 
 
+class RewindIn(BaseModel):
+    # 不加下界约束: 低于链锚点(含负数)统一走 409, 而不是 422
+    target_seq: int = Field(...)
+
+
 class CompactIn(BaseModel):
     cutoff_seq: int = Field(..., ge=0)
     dry_run: bool = False
@@ -198,7 +203,7 @@ def replay(req: ReplayIn):
     }
 
 
-# ---------- consumer cursor: pull / ack ----------
+# ---------- consumer cursor: pull / ack / rewind ----------
 
 @app.post("/consumers/{consumer_id}/pull")
 def pull(
@@ -336,6 +341,84 @@ def ack(
         "consumer_id": consumer_id,
         "acknowledged": True,
         "cursor_seq": to_seq,
+    }
+
+
+@app.post("/consumers/{consumer_id}/rewind")
+def rewind(
+    consumer_id: str = Path(..., min_length=1, max_length=255),
+    req: RewindIn = Body(...),
+):
+    """将已登记 consumer 的游标回退到 target_seq, 下一次 pull 从 target_seq+1 重新投递。
+
+    - 仅允许回退到 [anchor_seq, cursor_seq]: 低于链锚点(事件已压缩归档)或
+      向前推进(target_seq > 当前游标)一律 409, 状态不变; 未知 consumer 同样 409。
+    - 存在未过期租约时 409; 已过期租约在同一事务内清除后再回退,
+      避免后续 pull 重投旧批次区间。
+    - 与 pull/ack/compact 共用 BEGIN IMMEDIATE 写锁, 并发下只有单一结果;
+      回退后游标不低于链锚点, 不会产出指向已压缩事件的租约。
+    """
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        consumer = conn.execute(
+            "SELECT cursor_seq, lease_token, lease_expires_at"
+            " FROM consumers WHERE consumer_id = ?",
+            (consumer_id,),
+        ).fetchone()
+        # 未知 consumer: 不像 pull 那样自动建档, 直接 409
+        if consumer is None:
+            return lease_conflict("unknown consumer")
+
+        if (
+            consumer["lease_token"] is not None
+            and datetime.fromisoformat(consumer["lease_expires_at"]) > now
+        ):
+            # 租约未过期: 回退会与在途批次冲突, 拒绝且状态不变
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "consumer has an active lease",
+                    "lease_expires_at": consumer["lease_expires_at"],
+                },
+            )
+
+        anchor_seq, _ = get_chain_anchor(conn)
+        cursor_seq = consumer["cursor_seq"]
+        target = req.target_seq
+        if target < anchor_seq:
+            # 目标早于链锚点: 对应事件已压缩归档, 无法重新投递
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "target_seq below chain anchor",
+                    "target_seq": target,
+                    "anchor_seq": anchor_seq,
+                },
+            )
+        if target > cursor_seq:
+            # 只允许回退; 向前推进只能经由 ack 整批确认
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "target_seq would advance cursor",
+                    "target_seq": target,
+                    "cursor_seq": cursor_seq,
+                },
+            )
+
+        # 同一事务内: 清除(已过期的)租约并回退游标
+        conn.execute(
+            "UPDATE consumers SET cursor_seq = ?, lease_token = NULL,"
+            " lease_from_seq = NULL, lease_to_seq = NULL, lease_expires_at = NULL"
+            " WHERE consumer_id = ?",
+            (target, consumer_id),
+        )
+    return {
+        "consumer_id": consumer_id,
+        "previous_cursor_seq": cursor_seq,
+        "cursor_seq": target,
+        "next_seq": target + 1,
     }
 
 
