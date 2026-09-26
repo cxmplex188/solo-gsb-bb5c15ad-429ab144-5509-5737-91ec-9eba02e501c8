@@ -140,7 +140,45 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack \
   -H 'Content-Type: application/json' -d "{\"lease_token\":\"$TOKEN\"}"
 ```
 
-### 7. 安全归档压缩
+### 7. 消费游标:回退重放
+
+已确认的游标可以回退,让一段历史事件(其记录仍在事件表中)从 `target_seq+1` 起重新投递。`target_seq` 必须落在闭区间 **`[anchor_seq, cursor_seq]`** 内——即不得低于链锚点(不能指向已压缩删除的事件),也不得向前推进(游标前移只能走 ack):
+
+```bash
+curl -X POST http://localhost:8000/consumers/worker-1/rewind \
+  -H 'Content-Type: application/json' \
+  -d '{"target_seq":50}'
+```
+
+```json
+{"consumer_id": "worker-1", "previous_cursor_seq": 80, "cursor_seq": 50, "next_seq": 51}
+```
+
+成功后下一次 `pull` 即从 `next_seq`(=`target_seq + 1`)重新投递。回退是幂等安全的:`target_seq == cursor_seq` 同样返回 200(空回退),`previous_cursor_seq` 与 `cursor_seq` 相等。
+
+**租约处理**:
+
+- 存在**未过期租约**时返回 **409**(`{"detail":"active lease exists"}`),游标与租约均不变——先确认批次或等租约过期后再回退;
+- 存在**已过期租约**时,在同一事务内先清除旧租约(token、区间、过期时间全部置空)再回退游标;下一次 `pull` 不会沿用旧批次区间,而是按新游标重新取批并发新 token,旧 token 立即作废;
+- 没有租约(从未拉取、已确认完毕、或上次是空批次)时直接回退。
+
+以下情况一律返回 **409**,且**状态保持不变**(不建档、不改游标、不动租约):
+
+| 情形 | detail | 附带字段 |
+|---|---|---|
+| 未知 consumer(rewind 不自动建档) | `unknown consumer` | — |
+| 存在未过期租约 | `active lease exists` | — |
+| `target_seq` 低于链锚点 | `target_seq below chain anchor` | `target_seq` / `anchor_seq` / `cursor_seq` |
+| `target_seq` 高于当前游标(向前推进) | `target_seq ahead of cursor` | `target_seq` / `anchor_seq` / `cursor_seq` |
+
+例如锚点为 40、游标为 80 时回退到 30:
+
+```json
+{"detail": "target_seq below chain anchor",
+ "target_seq": 30, "anchor_seq": 40, "cursor_seq": 80}
+```
+
+### 8. 安全归档压缩
 
 已确认消费的历史事件可压缩归档:物理删除 `(当前锚点, cutoff_seq]` 的连续事件前缀,并把最后一条被删记录的 `seq`/`hash` 持久化为**链锚点**,`/integrity` 之后从锚点继续校验,历史不可篡改性不受影响。
 
@@ -216,6 +254,7 @@ curl -s http://localhost:8000/integrity
 - **完整性哈希链**:每条记录引用上一条哈希,写入与链字段更新在同一事务完成(`BEGIN IMMEDIATE` 保证并发下链头一致);`GET /integrity` 全链校验。
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
 - **消费游标与租约**:每个 consumer 一行(`consumers` 表),保存已确认游标与当前租约(token、批次起止 seq、过期时间)。`pull` 在 `BEGIN IMMEDIATE` 事务内完成"判租约 → 取批次 → 写租约",与事件写入互斥,并发重复拉取只会得到同一个租约;`ack` 仅推进整批游标并清空租约,token 不符、过期或无租约一律 409。
+- **游标回退**:`POST /consumers/{id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"查 consumer → 判租约(未过期 409;已过期同事务清除)→ 校验 `target_seq ∈ [anchor_seq, cursor_seq]`(区间外 409 且不写任何状态)→ 回退游标"。`pull`/`ack`/`compact`/`rewind` 全走写事务串行化,并发交错只有一个结果胜出;压缩安全边界以所有 consumer 的最小游标为准,而回退不可能把游标移到锚点之下,因此任何存活租约都不可能引用已被压缩删除的事件。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
@@ -229,6 +268,7 @@ curl -s http://localhost:8000/integrity
 | GET | `/integrity` | 从链锚点校验完整性哈希链,返回 `verified`/`checked`/`first_break`/`anchor_seq` |
 | POST | `/consumers/{consumer_id}/pull` | 按首次接收顺序拉取并原子租用未确认事件(`limit`/`lease_seconds`) |
 | POST | `/consumers/{consumer_id}/ack` | 确认当前租约批次并推进游标;过期/伪造/旧 token 返回 409 |
+| POST | `/consumers/{consumer_id}/rewind` | 回退游标到 `target_seq`(须在 `[anchor_seq, cursor_seq]`);未过期租约/越界/未知 consumer 返回 409;过期租约同事务清除 |
 | POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`);越界 409 并返回 `safe_through_seq` |
 | GET | `/health` | 健康检查 |
 

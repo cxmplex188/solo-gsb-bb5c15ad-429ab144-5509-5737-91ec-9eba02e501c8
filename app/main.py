@@ -40,6 +40,10 @@ class AckIn(BaseModel):
     lease_token: str = Field(..., min_length=1, max_length=255)
 
 
+class RewindIn(BaseModel):
+    target_seq: int = Field(..., ge=0)
+
+
 class CompactIn(BaseModel):
     cutoff_seq: int = Field(..., ge=0)
     dry_run: bool = False
@@ -336,6 +340,81 @@ def ack(
         "consumer_id": consumer_id,
         "acknowledged": True,
         "cursor_seq": to_seq,
+    }
+
+
+@app.post("/consumers/{consumer_id}/rewind")
+def rewind(
+    consumer_id: str = Path(..., min_length=1, max_length=255),
+    req: RewindIn = Body(...),
+):
+    """把已登记 consumer 的确认游标回退到 target_seq(仅允许 [anchor_seq, cursor_seq])。
+
+    - target_seq 必须落在 [链锚点 anchor_seq, 当前 cursor_seq] 闭区间内:
+      低于链锚点(指向已压缩事件)或向前推进(超过当前游标)一律 409, 状态不变。
+    - 未知 consumer 一律 409(rewind 不建档)。
+    - 存在未过期租约时 409; 已过期租约在同一事务内清除后再回退。
+    - 成功后游标为 target_seq, 下一次 pull 从 target_seq+1 重新投递。
+    """
+    now = datetime.now(timezone.utc)
+    # BEGIN IMMEDIATE 与 pull/ack/compact 互斥, 保证校验与回退原子完成
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        consumer = conn.execute(
+            "SELECT cursor_seq, lease_token, lease_expires_at FROM consumers"
+            " WHERE consumer_id = ?",
+            (consumer_id,),
+        ).fetchone()
+        if consumer is None:
+            # 未知 consumer: 不建档, 状态不变
+            return lease_conflict("unknown consumer")
+        if (
+            consumer["lease_token"] is not None
+            and datetime.fromisoformat(consumer["lease_expires_at"]) > now
+        ):
+            # 未过期租约: 不允许回退, 等待租约确认或过期
+            return lease_conflict("active lease exists")
+
+        anchor_seq, _ = get_chain_anchor(conn)
+        cursor_seq = consumer["cursor_seq"]
+        if req.target_seq < anchor_seq:
+            # 低于链锚点: target_seq+1 指向已压缩事件, 无法重新投递
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "target_seq below chain anchor",
+                    "target_seq": req.target_seq,
+                    "anchor_seq": anchor_seq,
+                    "cursor_seq": cursor_seq,
+                },
+            )
+        if req.target_seq > cursor_seq:
+            # 向前推进: rewind 只能回退, 游标前移请走 ack
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "target_seq ahead of cursor",
+                    "target_seq": req.target_seq,
+                    "anchor_seq": anchor_seq,
+                    "cursor_seq": cursor_seq,
+                },
+            )
+
+        # 全部校验通过后才写库: 同一条 UPDATE 回退游标并清除已过期租约
+        # (含可能残留的 NULL 空租约), 使下次 pull 从新游标重新取批,
+        # 而不是沿用旧批次区间重新投递
+        conn.execute(
+            "UPDATE consumers SET cursor_seq = ?, lease_token = NULL,"
+            " lease_from_seq = NULL, lease_to_seq = NULL, lease_expires_at = NULL"
+            " WHERE consumer_id = ?",
+            (req.target_seq, consumer_id),
+        )
+
+    return {
+        "consumer_id": consumer_id,
+        "previous_cursor_seq": cursor_seq,
+        "cursor_seq": req.target_seq,
+        "next_seq": req.target_seq + 1,
     }
 
 
